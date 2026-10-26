@@ -7,11 +7,9 @@ falsely inflated the savings-vs-baseline percentage on
 
 Current implementation is two-tier:
 
-  Tier 1 — `litellm_cost_usd` plumbed through the response's `_orca_meta`.
-  This is LiteLLM's `_hidden_params.response_cost`, computed at the moment
-  the Router knew which provider it actually called. Authoritative because
-  it knows about Anthropic prompt caching, OpenAI reasoning tokens, audio
-  pricing, and provider aliasing.
+  Tier 1 — positive upstream usage.cost_usd, then LiteLLM's estimate from
+  `_orca_meta`. The upstream billed cost wins when both are present.
+  The adapter estimate knows about cache usage and provider aliasing.
 
   Tier 2 — `tokens × catalog price` fallback. Used when LiteLLM didn't
   attach a cost (cache hits served from our prompt cache, exception paths,
@@ -26,6 +24,44 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+
+
+@pytest.mark.parametrize("upstream,expected", [
+    (0.123, 123000), (0.000125, 125),
+    (None, 500), (0, 500), (-1, 500), (float("nan"), 500),
+    (float("inf"), 500), (True, 500), ("0.123", 500),
+])
+async def test_log_prefers_valid_upstream_cost_then_adapter_estimate(upstream, expected):
+    import time
+
+    from app.routes.chat import _build_log_row
+    from app.schemas import ChatCompletionRequest
+    from packages.auth.types import KeyContext
+
+    row = await _build_log_row(
+        body=ChatCompletionRequest(model="gpt-5", messages=[{"role": "user", "content": "hi"}]),
+        kc=KeyContext(key_id="test-key", workspace_id="test-workspace", name="test"),
+        response={"model": "gpt-5", "usage": {"prompt_tokens": 1, "completion_tokens": 1, "cost_usd": upstream},
+                  "_orca_meta": {"provider": "orcarouter", "cost_usd": 0.0005}},
+        status_code=200, error_type=None, started_perf=time.perf_counter(),
+        strategy="balanced", requested_model="gpt-5",
+    )
+    assert row.cost_microcents == expected
+
+
+@pytest.mark.parametrize("history,expected", [
+    (None, None), ({}, None), ([], None), ([None, {}, {"usage": None}], None),
+    ([{"usage": {"cost": 0.123}}], None),
+    ([{"usage": {"cost_usd": -1}}], None),
+    ([{"usage": {"cost_usd": 0.123}}, {"usage": {"cost_usd": 0, "cost": 0.003375}}], 0.123),
+    ([{"usage": {"cost_usd": 0.123}}, {"usage": {"cost_usd": float("nan")}}], 0.123),
+    ([SimpleNamespace(usage=SimpleNamespace(cost_usd=0.123))], 0.123),
+])
+def test_retained_stream_history_recovers_only_explicit_positive_upstream_cost(history, expected):
+    from app.routes.chat import _retained_upstream_cost_usd
+
+    assert _retained_upstream_cost_usd(SimpleNamespace(chunks=history)) == expected
+    assert _retained_upstream_cost_usd(object()) is None
 
 
 @pytest.mark.parametrize("details,top,rate,provider,expected", [

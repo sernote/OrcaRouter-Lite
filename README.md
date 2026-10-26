@@ -279,7 +279,8 @@ x-orca-cache: HIT          ← served from cache, no upstream call
 
 `GET /v1/analytics/savings?baseline=gpt-4o&days=7` reports what your traffic would have cost on always-GPT-4 vs what it actually cost. The dashboard shows it as a tile.
 
-Request logs prefer a positive adapter-reported cost. Otherwise they estimate
+Request logs prefer a positive upstream `usage.cost_usd`, followed by the
+adapter-reported cost. Otherwise they estimate
 cost from the local LiteLLM catalog, applying an explicit cache-read rate to
 valid cached tokens within the inclusive prompt count. Missing rates or
 invalid cache counters keep the ordinary input estimate; discounts are not

@@ -224,7 +224,7 @@ async def _build_log_row(
         input_tokens=input_t,
         output_tokens=output_t,
         cost_microcents=_compute_cost_microcents(
-            litellm_cost_usd=_positive_cost_usd(meta.get("cost_usd")) or _positive_cost_usd(usage.get("cost_usd")),
+            litellm_cost_usd=_positive_cost_usd(usage.get("cost_usd")) or _positive_cost_usd(meta.get("cost_usd")),
             model_id=resolved,
             input_tokens=input_t,
             output_tokens=output_t,
@@ -243,6 +243,25 @@ def _positive_cost_usd(value) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     return value if math.isfinite(value) and value > 0 else None
+
+
+def _retained_upstream_cost_usd(stream_obj: object) -> float | None:
+    """LiteLLM may omit upstream extensions when rebuilding terminal usage.
+
+    Recover only explicit usage.cost_usd from retained provider chunks,
+    never its locally computed usage.cost. Older/other wrappers without
+    this optional history continue through the usual fallback.
+    """
+    chunks = getattr(stream_obj, "chunks", None)
+    if not isinstance(chunks, (list, tuple)):
+        return None
+    for chunk in reversed(chunks):
+        usage = chunk.get("usage") if isinstance(chunk, dict) else getattr(chunk, "usage", None)
+        value = usage.get("cost_usd") if isinstance(usage, dict) else getattr(usage, "cost_usd", None)
+        cost = _positive_cost_usd(value)
+        if cost is not None:
+            return cost
+    return None
 
 
 def _cache_read_tokens(usage: dict, input_tokens: int) -> int:
@@ -282,10 +301,10 @@ def _compute_cost_microcents(
 
     Two-tier strategy:
 
-      Tier 1 — `litellm_cost_usd` from the response's _orca_meta. This is
-      LiteLLM's own `_hidden_params.response_cost`, computed in the adapter
-      at the moment LiteLLM Router knew which provider it actually called.
-      Authoritative because it includes:
+      Tier 1 — positive upstream usage.cost_usd, then the adapter's estimate
+      from _orca_meta. The latter is LiteLLM's `_hidden_params.response_cost`,
+      computed when Router knew which provider it actually called. Its
+      estimate can account for more than our catalog fallback:
         - Anthropic cache read/write pricing
         - OpenAI o1/o3 reasoning tokens (priced separately from output)
         - Audio input/output token pricing
@@ -310,7 +329,7 @@ def _compute_cost_microcents(
     if input_tokens < 0 or output_tokens < 0:
         return 0
 
-    # Tier 1: LiteLLM's authoritative number, plumbed through _orca_meta.
+    # Tier 1: the selected positive reported cost.
     if _positive_cost_usd(litellm_cost_usd) is not None:
         return max(0, int(litellm_cost_usd * 1_000_000))
 
@@ -697,6 +716,7 @@ async def execute_chat(
             agg_fallback = False
             agg_latency = 0
             agg_cost_usd: float | None = None
+            agg_upstream_cost_usd: float | None = None
             # The first chunk's `model` field tells us what LiteLLM actually
             # served (could be a cascaded fallback, not the resolved primary).
             agg_model: str | None = None
@@ -747,9 +767,13 @@ async def execute_chat(
                             if agg_model in (d.litellm_model, d.model_name) or bare_served == d.model_name:
                                 agg_provider = d.provider
                                 break
+                usage_for_log = dict(agg_usage)
+                upstream_cost = agg_upstream_cost_usd or _retained_upstream_cost_usd(stream_obj)
+                if upstream_cost is not None:
+                    usage_for_log["cost_usd"] = upstream_cost
                 synthetic = {
                     "model": agg_model or resolved_model,
-                    "usage": agg_usage,
+                    "usage": usage_for_log,
                     "_orca_meta": {
                         "provider": agg_provider,
                         "cost_usd": _positive_cost_usd(hidden_params_of(stream_obj).get("response_cost")) or agg_cost_usd,
@@ -924,6 +948,9 @@ async def execute_chat(
                             agg_fallback = True
                     if "usage" in d and d["usage"]:
                         agg_usage = d["usage"]
+                        upstream_cost = _positive_cost_usd(agg_usage.get("cost_usd"))
+                        if upstream_cost is not None:
+                            agg_upstream_cost_usd = upstream_cost
                     if d.get("model"):
                         agg_model = d["model"]
                     last_d = d

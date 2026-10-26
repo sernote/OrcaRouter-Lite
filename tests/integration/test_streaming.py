@@ -159,7 +159,7 @@ async def stream_client(tmp_sqlite_url, monkeypatch):
 
 # ── tests ──
 
-@pytest.mark.parametrize("cost_source", ["frame", "wrapper", "chunk", "usage"])
+@pytest.mark.parametrize("cost_source", ["frame", "wrapper", "chunk", "usage", "usage-then-counters"])
 @pytest.mark.parametrize("surface", ["openai", "anthropic", "gemini"])
 async def test_cached_stream_cost_and_authoritative_controls_persist_to_spend(stream_client, monkeypatch, cost_source, surface):
     """Same engine/stream frames, varying only cache reads or explicit cost."""
@@ -190,6 +190,10 @@ async def test_cached_stream_cost_and_authoritative_controls_persist_to_spend(st
             terminal = {"model": model, "choices": [], "usage": self.usage}
             if explicit_cost and cost_source == "usage":
                 self.usage["cost_usd"] = explicit_cost
+                terminal["_orca_meta"] = {"provider": "openai", "cost_usd": 0.003375}
+            if explicit_cost and cost_source == "usage-then-counters":
+                yield {"model": model, "choices": [], "usage": {**self.usage, "cost_usd": explicit_cost}}
+                terminal["_orca_meta"] = {"provider": "openai", "cost_usd": 0.003375}
             if explicit_cost and cost_source == "frame":
                 terminal["_orca_meta"] = {"provider": "openai", "cost_usd": explicit_cost}
             if explicit_cost and cost_source == "chunk":
@@ -254,6 +258,84 @@ async def test_cached_stream_cost_and_authoritative_controls_persist_to_spend(st
     spend = await client.get("/v1/analytics/spend")
     assert spend.status_code == 200
     assert spend.json()["total_microcents"] == 193250
+
+
+@pytest.mark.parametrize("stream", [False, True])
+async def test_hosted_upstream_cost_overrides_litellm_estimate_in_persisted_log(stream_client, monkeypatch, stream):
+    """Hosted usage.cost_usd is billing truth; SDK-computed cost is an estimate."""
+    from types import SimpleNamespace
+
+    import httpx
+    from litellm.llms.openai.openai import OpenAIChatCompletion
+    from sqlalchemy import select
+
+    from app import router_cache
+    from packages.db import session as session_mod
+    from packages.db.models.request_log import RequestLog
+    from packages.litellm_adapter.client import OrcaLiteLLMClient
+
+    client, _ = stream_client
+    model = "gpt-5"
+    adapter_responses = []
+
+    def transport(request):
+        assert request.url.host == "provider.invalid"
+        assert request.headers["X-OrcaRouter-beta-usd"] == "response"
+        payload = json.loads(request.content)
+        usage = {"prompt_tokens": 10000, "completion_tokens": 100, "total_tokens": 10100,
+                 "prompt_tokens_details": {"cached_tokens": 9000}, "cost_usd": 0.123}
+        base = {"id": "chatcmpl-hosted-cost", "model": model, "created": 1}
+        if payload.get("stream"):
+            frames = [
+                {**base, "object": "chat.completion.chunk",
+                 "choices": [{"index": 0, "delta": {"content": "ok"}, "finish_reason": None}]},
+                {**base, "object": "chat.completion.chunk",
+                 "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+                {**base, "object": "chat.completion.chunk", "choices": [], "usage": usage},
+            ]
+            data = "".join("data: " + json.dumps(frame) + "\n\n" for frame in frames) + "data: [DONE]\n\n"
+            return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=data)
+        return httpx.Response(200, json={**base, "object": "chat.completion", "usage": usage,
+                                       "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"},
+                                                    "finish_reason": "stop"}]})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(transport)) as provider_http:
+        monkeypatch.setattr(OpenAIChatCompletion, "_get_async_http_client", staticmethod(lambda **kw: provider_http))
+        settings = SimpleNamespace(orcarouter_api_key="sk-test", orcarouter_base_url="https://provider.invalid/v1")
+        hosted = next(d for d in router_cache.build_deployments(env_keys={}, db_keys=[], settings=settings)
+                      if d.model_name == model)
+        adapter = OrcaLiteLLMClient([hosted], cooldown_time=0, allowed_fails=0,
+                                   enable_pre_call_checks=False, num_retries=0)
+        acompletion = adapter.acompletion
+
+        async def record_response(**kwargs):
+            response = await acompletion(**kwargs)
+            adapter_responses.append(response)
+            return response
+
+        monkeypatch.setattr(adapter, "acompletion", record_response)
+        monkeypatch.setattr(router_cache, "get_router", AsyncMock(return_value=adapter))
+        response = await client.post("/v1/chat/completions", json={
+            "model": model, "messages": [{"role": "user", "content": "hi"}], "stream": stream,
+        })
+    assert response.status_code == 200
+    if stream:
+        assert _chunks_from_sse(response.text)[-1]["usage"]["prompt_tokens"] == 10000
+        # LiteLLM rebuilds terminal usage and drops this extension there,
+        # but its retained provider usage still carries the exact cost.
+        assert any(getattr(getattr(chunk, "usage", None), "cost_usd", None) == 0.123
+                   for chunk in adapter_responses[0].chunks)
+    else:
+        assert adapter_responses[0]["usage"]["cost_usd"] == 0.123
+        estimate = adapter_responses[0]["_orca_meta"]["cost_usd"]
+        assert estimate > 0 and estimate != 0.123
+    async with session_mod._session_factory() as session:
+        rows = (await session.execute(select(RequestLog))).scalars().all()
+    assert [(row.provider, row.is_streaming, row.cost_microcents) for row in rows] == [
+        ("orcarouter", stream, 123000),
+    ]
+    spend = await client.get("/v1/analytics/spend")
+    assert spend.json()["total_microcents"] == 123000
 
 
 async def test_real_litellm_sdk_cached_stream_matches_blocking_and_uncached_control(stream_client, monkeypatch):
