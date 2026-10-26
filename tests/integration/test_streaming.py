@@ -261,7 +261,10 @@ async def test_cached_stream_cost_and_authoritative_controls_persist_to_spend(st
 
 
 @pytest.mark.parametrize("stream", [False, True])
-async def test_hosted_upstream_cost_overrides_litellm_estimate_in_persisted_log(stream_client, monkeypatch, stream):
+@pytest.mark.parametrize("upstream_cost,expected", [(0.123, 123000), (0, 0)])
+async def test_hosted_upstream_cost_overrides_litellm_estimate_in_persisted_log(
+    stream_client, monkeypatch, stream, upstream_cost, expected,
+):
     """Hosted usage.cost_usd is billing truth; SDK-computed cost is an estimate."""
     from types import SimpleNamespace
 
@@ -283,7 +286,7 @@ async def test_hosted_upstream_cost_overrides_litellm_estimate_in_persisted_log(
         assert request.headers["X-OrcaRouter-beta-usd"] == "response"
         payload = json.loads(request.content)
         usage = {"prompt_tokens": 10000, "completion_tokens": 100, "total_tokens": 10100,
-                 "prompt_tokens_details": {"cached_tokens": 9000}, "cost_usd": 0.123}
+                 "prompt_tokens_details": {"cached_tokens": 9000}, "cost_usd": upstream_cost}
         base = {"id": "chatcmpl-hosted-cost", "model": model, "created": 1}
         if payload.get("stream"):
             frames = [
@@ -323,19 +326,105 @@ async def test_hosted_upstream_cost_overrides_litellm_estimate_in_persisted_log(
         assert _chunks_from_sse(response.text)[-1]["usage"]["prompt_tokens"] == 10000
         # LiteLLM rebuilds terminal usage and drops this extension there,
         # but its retained provider usage still carries the exact cost.
-        assert any(getattr(getattr(chunk, "usage", None), "cost_usd", None) == 0.123
+        assert any(getattr(getattr(chunk, "usage", None), "cost_usd", None) == upstream_cost
                    for chunk in adapter_responses[0].chunks)
     else:
-        assert adapter_responses[0]["usage"]["cost_usd"] == 0.123
+        assert adapter_responses[0]["usage"]["cost_usd"] == upstream_cost
         estimate = adapter_responses[0]["_orca_meta"]["cost_usd"]
-        assert estimate > 0 and estimate != 0.123
+        assert estimate > 0 and estimate != upstream_cost
     async with session_mod._session_factory() as session:
         rows = (await session.execute(select(RequestLog))).scalars().all()
     assert [(row.provider, row.is_streaming, row.cost_microcents) for row in rows] == [
-        ("orcarouter", stream, 123000),
+        ("orcarouter", stream, expected),
     ]
     spend = await client.get("/v1/analytics/spend")
-    assert spend.json()["total_microcents"] == 123000
+    assert spend.json()["total_microcents"] == expected
+
+
+@pytest.mark.parametrize("cost_path", ["observed", "retained"])
+@pytest.mark.parametrize("earlier,final,expected", [
+    pytest.param({}, {}, 1000, id="matching-counters"),
+    pytest.param({}, {"prompt_tokens": 2000}, 500, id="prompt-growth"),
+    pytest.param({}, {"prompt_tokens": 500}, 500, id="prompt-shrink"),
+    pytest.param({}, {"completion_tokens": 200}, 500, id="completion-growth"),
+    pytest.param({}, {"completion_tokens": 50}, 500, id="completion-shrink"),
+    pytest.param({"prompt_tokens": None}, {}, 500, id="missing-earlier-prompt"),
+    pytest.param({"completion_tokens": None}, {}, 500, id="missing-earlier-completion"),
+    pytest.param({}, {"prompt_tokens": None}, 500, id="missing-final-prompt"),
+    pytest.param({}, {"completion_tokens": None}, 500, id="missing-final-completion"),
+    pytest.param({"prompt_tokens": True}, {"prompt_tokens": 1}, 500, id="bool-counter"),
+    pytest.param({"prompt_tokens": 1000.0}, {}, 500, id="float-counter"),
+    pytest.param({}, {"cost_usd": 0}, 0, id="final-zero"),
+    pytest.param({"cost_usd": 0}, {}, 0, id="recovered-zero"),
+    pytest.param({}, {"cost_usd": 0.002}, 2000, id="latest-final-cost"),
+    pytest.param({"cost_usd": -1}, {}, 500, id="negative-history"),
+    pytest.param({"cost_usd": float("nan")}, {}, 500, id="nan-history"),
+    pytest.param({"cost_usd": float("inf")}, {}, 500, id="infinite-history"),
+    pytest.param({"cost_usd": True}, {}, 500, id="bool-history"),
+    pytest.param({"cost_usd": "0.001"}, {}, 500, id="malformed-history"),
+    pytest.param({}, {"cost_usd": -1}, 500, id="invalid-final-does-not-revive-history"),
+    pytest.param({}, {"cost_usd": float("nan")}, 500, id="nan-final-does-not-revive-history"),
+    pytest.param({}, {"cost_usd": False}, 500, id="bool-final-does-not-revive-history"),
+    pytest.param([{}, {"cost_usd": 0.002}], {}, 2000, id="latest-retained-cost"),
+    pytest.param([{}, {"cost_usd": 0}], {}, 0, id="latest-retained-zero"),
+    pytest.param([{}, {"cost_usd": -1}], {}, 500, id="latest-retained-invalid"),
+    pytest.param([{}, {"prompt_tokens": 500, "cost_usd": 0.003}], {}, 500,
+                 id="latest-retained-mismatch-does-not-revive-older-match"),
+    pytest.param({"cost_usd": None}, {"cost": 0.25}, 500, id="local-cost-is-not-billing"),
+    pytest.param({"prompt_tokens_details": {"cached_tokens": 900}},
+                 {"prompt_tokens_details": {"cached_tokens": 0}}, 500, id="cache-read-changed"),
+    pytest.param({"cache_read_input_tokens": 900},
+                 {"prompt_tokens_details": {"cached_tokens": 0}}, 500, id="cache-read-alias-changed"),
+    pytest.param({"cache_creation_input_tokens": 100},
+                 {"prompt_tokens_details": {"cache_write_tokens": 200}}, 500, id="cache-write-changed"),
+    pytest.param({"cache_read_input_tokens": 900},
+                 {"prompt_tokens_details": {"cached_tokens": 900}}, 1000, id="matching-cache-alias"),
+    pytest.param({"cache_read_input_tokens": 900, "prompt_tokens_details": {"cached_tokens": 800}},
+                 {"cache_read_input_tokens": 900}, 500, id="conflicting-cache-aliases"),
+])
+async def test_recovered_stream_bill_matches_final_usage_in_sql_and_spend(
+    stream_client, cost_path, earlier, final, expected,
+):
+    """Counter-only terminal rebuilds must not borrow another usage frame's bill."""
+    from types import SimpleNamespace
+
+    from sqlalchemy import select
+
+    from packages.db import session as session_mod
+    from packages.db.models.request_log import RequestLog
+
+    client, fake = stream_client
+    history = [{"prompt_tokens": 1000, "completion_tokens": 100, "cost_usd": 0.001, **item}
+               for item in (earlier if isinstance(earlier, list) else [earlier])]
+    terminal = {"prompt_tokens": 1000, "completion_tokens": 100, **final}
+    history = [{key: value for key, value in item.items() if value is not None} for item in history]
+    terminal = {key: value for key, value in terminal.items() if value is not None}
+
+    class Stream:
+        # Real SDK history contains typed usage objects. The observed path
+        # intentionally has no retained history to rescue broken aggregation.
+        chunks = [SimpleNamespace(usage=SimpleNamespace(**item)) for item in history] if cost_path == "retained" else []
+
+        async def __aiter__(self):
+            if cost_path == "observed":
+                for previous in history:
+                    yield {"model": "gpt-4o-mini", "choices": [], "usage": previous}
+            yield {"model": "gpt-4o-mini", "choices": [], "usage": terminal,
+                   "_orca_meta": {"provider": "openai", "cost_usd": 0.0005}}
+
+    fake.acompletion.side_effect = lambda **kwargs: Stream()
+    response = await client.post("/v1/chat/completions", json={
+        "model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}], "stream": True,
+    })
+    assert response.status_code == 200
+    async with session_mod._session_factory() as session:
+        rows = (await session.execute(select(RequestLog))).scalars().all()
+    assert [(row.input_tokens, row.output_tokens, row.cost_microcents) for row in rows] == [
+        (terminal.get("prompt_tokens", 0), terminal.get("completion_tokens", 0), expected),
+    ]
+    spend = await client.get("/v1/analytics/spend")
+    assert spend.status_code == 200
+    assert spend.json()["total_microcents"] == expected
 
 
 async def test_real_litellm_sdk_cached_stream_matches_blocking_and_uncached_control(stream_client, monkeypatch):
