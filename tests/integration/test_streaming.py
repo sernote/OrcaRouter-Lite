@@ -159,6 +159,170 @@ async def stream_client(tmp_sqlite_url, monkeypatch):
 
 # ── tests ──
 
+@pytest.mark.parametrize("cost_source", ["frame", "wrapper", "chunk", "usage"])
+@pytest.mark.parametrize("surface", ["openai", "anthropic", "gemini"])
+async def test_cached_stream_cost_and_authoritative_controls_persist_to_spend(stream_client, monkeypatch, cost_source, surface):
+    """Same engine/stream frames, varying only cache reads or explicit cost."""
+    from types import SimpleNamespace
+
+    from sqlalchemy import select
+
+    from packages.db import session as session_mod
+    from packages.db.models.request_log import RequestLog
+    from packages.litellm_adapter.catalog import CATALOG_BY_ID
+
+    client, fake = stream_client
+    model = "gpt-4o-mini"
+    priced = SimpleNamespace(**{**vars(CATALOG_BY_ID[model]),
+                               "input_cost_per_token": 2.5e-6, "output_cost_per_token": 1e-5,
+                               "cache_read_input_token_cost": 1.25e-6})
+    monkeypatch.setitem(CATALOG_BY_ID, model, priced)
+    cache_reads = 9000
+    explicit_cost = None
+
+    class Stream:
+        def __init__(self, usage):
+            self.usage = usage
+            self._hidden_params = {}
+
+        async def __aiter__(self):
+            yield {"model": model, "choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]}
+            terminal = {"model": model, "choices": [], "usage": self.usage}
+            if explicit_cost and cost_source == "usage":
+                self.usage["cost_usd"] = explicit_cost
+            if explicit_cost and cost_source == "frame":
+                terminal["_orca_meta"] = {"provider": "openai", "cost_usd": explicit_cost}
+            if explicit_cost and cost_source == "chunk":
+                from litellm.types.utils import ModelResponseStream
+
+                terminal = ModelResponseStream(**terminal)
+                terminal._hidden_params["response_cost"] = explicit_cost
+            yield terminal
+            if explicit_cost and cost_source == "wrapper":
+                self._hidden_params["response_cost"] = explicit_cost
+
+    async def upstream(**kwargs):
+        usage = {"prompt_tokens": 10000, "completion_tokens": 100, "total_tokens": 10100,
+                 "prompt_tokens_details": {"cached_tokens": cache_reads}}
+        if kwargs.get("stream"):
+            return Stream(usage)
+        return {"model": model, "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+                "usage": usage, "_orca_meta": {"provider": "openai", "cost_usd": 0.01475}}
+
+    fake.acompletion.side_effect = upstream
+
+    async def request(*, stream=False, deterministic=False):
+        if surface == "gemini":
+            action = "streamGenerateContent?alt=sse" if stream else "generateContent"
+            payload = {"contents": "hi"}
+            if deterministic:
+                payload["generationConfig"] = {"temperature": 0}
+            return await client.post(f"/v1beta/models/{model}:{action}", json=payload)
+        payload = {"model": model, "messages": [{"role": "user", "content": "hi"}], "stream": stream}
+        if deterministic:
+            payload["temperature"] = 0
+        if surface == "anthropic":
+            payload["max_tokens"] = 128
+        endpoint = "/v1/messages" if surface == "anthropic" else "/v1/chat/completions"
+        return await client.post(endpoint, json=payload)
+
+    blocking = await request()
+    cached = await request(stream=True)
+    cache_reads = 0
+    uncached = await request(stream=True)
+    cache_reads = 9000
+    explicit_cost = 0.123
+    authoritative = await request(stream=True)
+    assert all(r.status_code == 200 for r in (blocking, cached, uncached, authoritative))
+    if surface == "openai":
+        assert _chunks_from_sse(cached.text)[-1]["usage"]["prompt_tokens_details"]["cached_tokens"] == 9000
+    assert "_orca_meta" not in authoritative.text
+    fill = await request(deterministic=True)
+    hit = await request(deterministic=True)
+    assert fill.status_code == hit.status_code == 200
+    assert hit.headers["x-orca-cache"] == "HIT"
+    assert fake.acompletion.call_count == 5
+
+    async with session_mod._session_factory() as session:
+        rows = (await session.execute(select(RequestLog).order_by(RequestLog.created_at))).scalars().all()
+    assert [(row.is_streaming, row.input_tokens, row.output_tokens, row.cost_microcents) for row in rows] == [
+        (False, 10000, 100, 14750), (True, 10000, 100, 14750),
+        (True, 10000, 100, 26000), (True, 10000, 100, 123000),
+        (False, 10000, 100, 14750), (False, 10000, 100, 0),
+    ]
+    assert rows[-1].provider == "cache"
+    spend = await client.get("/v1/analytics/spend")
+    assert spend.status_code == 200
+    assert spend.json()["total_microcents"] == 193250
+
+
+async def test_real_litellm_sdk_cached_stream_matches_blocking_and_uncached_control(stream_client, monkeypatch):
+    """Real adapter + Router + OpenAI SDK; only HTTP transport is replaced."""
+    import httpx
+    from litellm.llms.openai.openai import OpenAIChatCompletion
+    from sqlalchemy import select
+
+    from app import router_cache
+    from packages.db import session as session_mod
+    from packages.db.models.request_log import RequestLog
+    from packages.litellm_adapter.catalog import CATALOG_BY_ID
+    from packages.litellm_adapter.client import OrcaLiteLLMClient
+    from packages.litellm_adapter.types import ProviderDeployment
+
+    client, _ = stream_client
+    model = "gpt-4o-2024-08-06"
+    reads = 9000
+    sent = []
+
+    def transport(request):
+        assert request.url.host == "provider.invalid"
+        payload = json.loads(request.content)
+        sent.append(payload)
+        usage = {"prompt_tokens": 10000, "completion_tokens": 100, "total_tokens": 10100,
+                 "prompt_tokens_details": {"cached_tokens": reads}}
+        base = {"id": "chatcmpl-cost", "model": model, "created": 1}
+        if payload.get("stream"):
+            frames = [
+                {**base, "object": "chat.completion.chunk",
+                 "choices": [{"index": 0, "delta": {"content": "ok"}, "finish_reason": None}]},
+                {**base, "object": "chat.completion.chunk",
+                 "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+                {**base, "object": "chat.completion.chunk", "choices": [], "usage": usage},
+            ]
+            data = "".join("data: " + json.dumps(frame) + "\n\n" for frame in frames) + "data: [DONE]\n\n"
+            return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=data)
+        return httpx.Response(200, json={**base, "object": "chat.completion", "usage": usage,
+                                       "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"},
+                                                    "finish_reason": "stop"}]})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(transport)) as provider_http:
+        monkeypatch.setattr(OpenAIChatCompletion, "_get_async_http_client", staticmethod(lambda **kw: provider_http))
+        adapter = OrcaLiteLLMClient([
+            ProviderDeployment(model_name=model, litellm_model="openai/" + model,
+                               api_key="sk-test", provider="openai", api_base="https://provider.invalid/v1"),
+        ], cooldown_time=0, allowed_fails=0, enable_pre_call_checks=False, num_retries=0)
+        monkeypatch.setattr(router_cache, "get_router", AsyncMock(return_value=adapter))
+        payload = {"model": model, "messages": [{"role": "user", "content": "hi"}]}
+        blocking = await client.post("/v1/chat/completions", json=payload)
+        cached = await client.post("/v1/chat/completions", json={**payload, "stream": True})
+        reads = 0
+        uncached = await client.post("/v1/chat/completions", json={**payload, "stream": True})
+    assert all(r.status_code == 200 for r in (blocking, cached, uncached))
+    assert len(sent) == 3
+    assert _chunks_from_sse(cached.text)[-1]["usage"]["prompt_tokens_details"]["cached_tokens"] == 9000
+
+    priced = CATALOG_BY_ID[model]
+    cached_cost = int((1000 * priced.input_cost_per_token + 9000 * priced.cache_read_input_token_cost
+                       + 100 * priced.output_cost_per_token) * 1_000_000)
+    full_cost = int((10000 * priced.input_cost_per_token + 100 * priced.output_cost_per_token) * 1_000_000)
+    async with session_mod._session_factory() as session:
+        rows = (await session.execute(select(RequestLog).order_by(RequestLog.created_at))).scalars().all()
+    assert [row.cost_microcents for row in rows] == [cached_cost, cached_cost, full_cost]
+    assert all(row.provider == "openai" for row in rows)
+    spend = await client.get("/v1/analytics/spend")
+    assert spend.json()["total_microcents"] == 2 * cached_cost + full_cost
+
+
 async def test_streaming_returns_sse_content_type(stream_client):
     client, _ = stream_client
     r = await client.post(

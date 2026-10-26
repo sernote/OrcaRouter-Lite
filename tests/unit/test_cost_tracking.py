@@ -23,6 +23,76 @@ pass a non-None value to exercise tier 1.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
+import pytest
+
+
+@pytest.mark.parametrize("details,top,rate,provider,expected", [
+    ({"cached_tokens": 9000}, None, 1.25e-6, "openai", 14750),
+    ({"cached_tokens": 9000, "cache_write_tokens": 500}, None, 1.25e-6, "openai", 14750),
+    ({"cached_tokens": 9000, "cache_write_tokens": 1001}, None, 1.25e-6, "openai", 26000),
+    ({"cached_tokens": 9000, "cache_write_tokens": -1}, None, 1.25e-6, "openai", 26000),
+    ({"cached_tokens": 9000, "cache_write_tokens": 1, "cache_creation_tokens": 2}, None, 1.25e-6, "openai", 26000),
+    ({"cached_tokens": 0}, None, 1.25e-6, "openai", 26000),
+    ({}, 9000, 1.25e-6, "openai", 14750),
+    ({"cached_tokens": 9000}, 9000, 1.25e-6, "openai", 14750),
+    ({"cached_tokens": 9000}, 8000, 1.25e-6, "openai", 26000),
+    ({"cached_tokens": 9000}, None, None, "openai", 26000),
+    ({"cached_tokens": 9000}, None, 0.0, "openai", 3500),
+    ({"cached_tokens": 9000}, None, 1.25e-6, "orcarouter", 26000),
+    ({"cached_tokens": 9000}, None, 1.25e-6, "unknown", 14750),
+    ({"cached_tokens": -1}, None, 1.25e-6, "openai", 26000),
+    ({"cached_tokens": 10001}, None, 1.25e-6, "openai", 26000),
+    ({"cached_tokens": True}, None, 1.25e-6, "openai", 26000),
+    ({"cached_tokens": "9000"}, None, 1.25e-6, "openai", 26000),
+    ({"cached_tokens": 9000.5}, None, 1.25e-6, "openai", 26000),
+    ({"cached_tokens": None}, None, 1.25e-6, "openai", 26000),
+])
+def test_cache_read_fallback_uses_only_known_bounded_read_tokens(monkeypatch, details, top, rate, provider, expected):
+    from app.routes.chat import _compute_cost_microcents
+    from packages.litellm_adapter.catalog import CATALOG_BY_ID
+
+    model = SimpleNamespace(**{**vars(CATALOG_BY_ID["gpt-4o"]),
+                              "input_cost_per_token": 2.5e-6, "output_cost_per_token": 1e-5,
+                              "cache_read_input_token_cost": rate})
+    monkeypatch.setitem(CATALOG_BY_ID, "gpt-4o", model)
+    usage = {"prompt_tokens_details": details}
+    if top is not None:
+        usage["cache_read_input_tokens"] = top
+    assert _compute_cost_microcents(
+        litellm_cost_usd=None, model_id="openai/gpt-4o", input_tokens=10000,
+        output_tokens=100, usage=usage, provider=provider,
+    ) == expected
+
+
+@pytest.mark.parametrize("rate", [-1.0, float("nan"), float("inf"), "unknown", True])
+def test_catalog_omits_unusable_cache_read_rates(monkeypatch, rate):
+    import litellm
+
+    from packages.litellm_adapter.catalog import _build_catalog_from_litellm
+
+    monkeypatch.setattr(litellm, "model_cost", {"invalid-cache-rate": {
+        "litellm_provider": "openai", "mode": "chat", "cache_read_input_token_cost": rate,
+    }})
+    model = next(m for m in _build_catalog_from_litellm() if m.id == "invalid-cache-rate")
+    assert model.cache_read_input_token_cost is None
+
+
+@pytest.mark.parametrize("resolved", ["unpriced-rebrand", "gpt-4o-20991231"])
+def test_requested_or_version_guessed_model_does_not_establish_cache_read_rate(monkeypatch, resolved):
+    from app.routes.chat import _compute_cost_microcents
+    from packages.litellm_adapter.catalog import CATALOG_BY_ID
+
+    model = SimpleNamespace(**{**vars(CATALOG_BY_ID["gpt-4o"]),
+                              "input_cost_per_token": 2.5e-6, "output_cost_per_token": 1e-5,
+                              "cache_read_input_token_cost": 1.25e-6})
+    monkeypatch.setitem(CATALOG_BY_ID, "gpt-4o", model)
+    assert _compute_cost_microcents(
+        litellm_cost_usd=None, model_id=resolved, fallback_model="gpt-4o",
+        input_tokens=10000, output_tokens=100, usage={"prompt_tokens_details": {"cached_tokens": 9000}},
+    ) == 26000
+
 # ── Tier 1: LiteLLM's pre-computed cost takes priority ──────────────────
 
 
